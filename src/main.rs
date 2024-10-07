@@ -17,12 +17,13 @@ mod options;
 use log::debug;
 use options::Options;
 use rustc_session::config::ErrorOutputType;
-use rustc_session::early_error;
+use rustc_session::EarlyDiagCtxt;
 
 fn main() {
     // Initialize loggers.
+    let handler = EarlyDiagCtxt::new(ErrorOutputType::default());
     if std::env::var("RUSTC_LOG").is_ok() {
-        rustc_driver::init_rustc_env_logger();
+        rustc_driver::init_rustc_env_logger(&handler);
     }
     if std::env::var("LOCKBUD_LOG").is_ok() {
         let e = env_logger::Env::new()
@@ -33,15 +34,12 @@ fn main() {
     // Get any options specified via the LOCKBUD_FLAGS environment variable
     let options = Options::parse_from_str(&std::env::var("LOCKBUD_FLAGS").unwrap_or_default())
         .unwrap_or_default();
-    debug!("LOCKBUD options from environment: {:?}", options);
+    debug!("LOCKBUD options from environment: {options:?}");
     let mut args = std::env::args_os()
         .enumerate()
         .map(|(i, arg)| {
             arg.into_string().unwrap_or_else(|arg| {
-                early_error(
-                    ErrorOutputType::default(),
-                    &format!("Argument {} is not valid Unicode: {:?}", i, arg),
-                )
+                handler.early_fatal(format!("Argument {i} is not valid Unicode: {arg:?}"))
             })
         })
         .collect::<Vec<_>>();
@@ -53,64 +51,52 @@ fn main() {
         args.remove(1);
     }
 
-    let mut rustc_command_line_arguments: Vec<String> = args[1..].into();
-    rustc_driver::install_ice_hook();
-    let result = rustc_driver::catch_fatal_errors(|| {
-        // Add back the binary name
-        rustc_command_line_arguments.insert(0, args[0].clone());
-
-        let print: String = "--print=".into();
+    let mut rustc_command_line_arguments = args;
+    rustc_driver::install_ice_hook("ice ice ice baby", |_| ());
+    let exit_code = rustc_driver::catch_with_exit_code(|| {
+        let print = "--print=";
         if rustc_command_line_arguments
             .iter()
-            .any(|arg| arg.starts_with(&print))
+            .any(|arg| arg.starts_with(print))
         {
             // If a --print option is given on the command line we wont get called to analyze
             // anything. We also don't want to the caller to know that LOCKBUD adds configuration
             // parameters to the command line, lest the caller be cargo and it panics because
             // the output from --print=cfg is not what it expects.
         } else {
-            let sysroot: String = "--sysroot".into();
+            let sysroot = "--sysroot";
             if !rustc_command_line_arguments
                 .iter()
-                .any(|arg| arg.starts_with(&sysroot))
+                .any(|arg| arg.starts_with(sysroot))
             {
                 // Tell compiler where to find the std library and so on.
                 // The compiler relies on the standard rustc driver to tell it, so we have to do likewise.
-                rustc_command_line_arguments.push(sysroot);
-                rustc_command_line_arguments.push(find_sysroot());
+                rustc_command_line_arguments.push(format!("{sysroot}={}", find_sysroot()));
             }
 
-            let always_encode_mir: String = "always-encode-mir".into();
+            let always_encode_mir = "always-encode-mir";
             if !rustc_command_line_arguments
                 .iter()
-                .any(|arg| arg.ends_with(&always_encode_mir))
+                .any(|arg| arg.ends_with(always_encode_mir))
             {
                 // Tell compiler to emit MIR into crate for every function with a body.
-                rustc_command_line_arguments.push("-Z".into());
-                rustc_command_line_arguments.push(always_encode_mir);
+                rustc_command_line_arguments.push(format!("-Z{always_encode_mir}"));
             }
         }
 
         let mut callbacks = callbacks::LockBudCallbacks::new(options);
-        debug!(
-            "rustc_command_line_arguments {:?}",
-            rustc_command_line_arguments
-        );
+        debug!("rustc_command_line_arguments {rustc_command_line_arguments:?}");
         let compiler =
             rustc_driver::RunCompiler::new(&rustc_command_line_arguments, &mut callbacks);
         compiler.run()
-    })
-    .and_then(|result| result);
-    let exit_code = match result {
-        Ok(_) => rustc_driver::EXIT_SUCCESS,
-        Err(_) => rustc_driver::EXIT_FAILURE,
-    };
+    });
     std::process::exit(exit_code);
 }
 
 fn find_sysroot() -> String {
     let home = option_env!("RUSTUP_HOME");
     let toolchain = option_env!("RUSTUP_TOOLCHAIN");
+    #[allow(clippy::option_env_unwrap)]
     match (home, toolchain) {
         (Some(home), Some(toolchain)) => format!("{}/toolchains/{}", home, toolchain),
         _ => option_env!("RUST_SYSROOT")

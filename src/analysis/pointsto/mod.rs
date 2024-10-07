@@ -17,9 +17,11 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::def_id::DefId;
 use rustc_middle::mir::visit::Visitor;
 use rustc_middle::mir::{
-    Body, Constant, ConstantKind, Local, Location, Operand, Place, PlaceElem, PlaceRef,
-    ProjectionElem, Rvalue, Statement, StatementKind, Terminator, TerminatorKind,
+    Body, ConstOperand, Local, Location, Operand, Place, PlaceElem, PlaceRef, ProjectionElem,
+    Rvalue, Statement, StatementKind, Terminator, TerminatorKind,
 };
+
+use rustc_middle::mir::Const;
 use rustc_middle::ty::{Instance, TyCtxt, TyKind};
 
 use petgraph::dot::{Config, Dot};
@@ -28,6 +30,7 @@ use petgraph::visit::EdgeRef;
 use petgraph::{Directed, Direction, Graph};
 
 use crate::analysis::callgraph::{CallGraph, CallGraphNode, CallSiteLocation, InstanceId};
+use crate::interest::concurrency::atomic::is_atomic_ptr_store;
 use crate::interest::concurrency::lock::LockGuardId;
 use crate::interest::memory::ownership;
 
@@ -71,10 +74,10 @@ impl<'a, 'tcx> Andersen<'a, 'tcx> {
                 ConstraintNode::Place(place) => {
                     graph.add_alloc(place);
                 }
-                ConstraintNode::Constant(constant) => {
-                    graph.add_constant(constant);
+                ConstraintNode::Constant(ref constant) => {
+                    graph.add_constant(*constant);
                     // For constant C, track *C.
-                    worklist.push_back(ConstraintNode::ConstantDeref(constant));
+                    worklist.push_back(ConstraintNode::ConstantDeref(*constant));
                 }
                 _ => {}
             }
@@ -84,7 +87,7 @@ impl<'a, 'tcx> Andersen<'a, 'tcx> {
         // address: target = &source
         for (source, target, weight) in graph.edges() {
             if weight == ConstraintEdge::Address {
-                self.pts.entry(target).or_default().insert(source);
+                self.pts.entry(target.clone()).or_default().insert(source);
                 worklist.push_back(target);
             }
         }
@@ -96,21 +99,21 @@ impl<'a, 'tcx> Andersen<'a, 'tcx> {
             for o in self.pts.get(&node).unwrap() {
                 // store: *node = source
                 for source in graph.store_sources(&node) {
-                    if graph.insert_edge(source, *o, ConstraintEdge::Copy) {
+                    if graph.insert_edge(source.clone(), o.clone(), ConstraintEdge::Copy) {
                         worklist.push_back(source);
                     }
                 }
                 // load: target = *node
                 for target in graph.load_targets(&node) {
-                    if graph.insert_edge(*o, target, ConstraintEdge::Copy) {
-                        worklist.push_back(*o);
+                    if graph.insert_edge(o.clone(), target, ConstraintEdge::Copy) {
+                        worklist.push_back(o.clone());
                     }
                 }
             }
             // alias_copy: target = &X; X = ptr::read(node)
             for target in graph.alias_copy_targets(&node) {
-                if graph.insert_edge(node, target, ConstraintEdge::Copy) {
-                    worklist.push_back(node);
+                if graph.insert_edge(node.clone(), target, ConstraintEdge::Copy) {
+                    worklist.push_back(node.clone());
                 }
             }
             // copy: target = node
@@ -131,7 +134,7 @@ impl<'a, 'tcx> Andersen<'a, 'tcx> {
         let old_len = self.pts.get(target).unwrap().len();
         let source_pts = self.pts.get(source).unwrap().clone();
         let target_pts = self.pts.get_mut(target).unwrap();
-        target_pts.extend(source_pts.into_iter());
+        target_pts.extend(source_pts);
         old_len != target_pts.len()
     }
 
@@ -151,12 +154,12 @@ impl<'a, 'tcx> Andersen<'a, 'tcx> {
 /// To enable the propagtion of points-to info for `Constant`,
 /// we introduce `ConstantDeref` to denote the points-to node of `Constant`,
 /// namely, forall Constant(c), Constant(c)--|address|-->ConstantDeref(c).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ConstraintNode<'tcx> {
     Alloc(PlaceRef<'tcx>),
     Place(PlaceRef<'tcx>),
-    Constant(ConstantKind<'tcx>),
-    ConstantDeref(ConstantKind<'tcx>),
+    Constant(Const<'tcx>),
+    ConstantDeref(Const<'tcx>),
 }
 
 /// The assignments in MIR with default `mir-opt-level` (level 1) are simplified
@@ -185,11 +188,12 @@ enum ConstraintEdge {
     AliasCopy, // Special: y=Arc::clone(x) or y=ptr::read(x)
 }
 
+#[derive(Debug)]
 enum AccessPattern<'tcx> {
     Ref(PlaceRef<'tcx>),
     Indirect(PlaceRef<'tcx>),
     Direct(PlaceRef<'tcx>),
-    Constant(ConstantKind<'tcx>),
+    Constant(Const<'tcx>),
 }
 
 #[derive(Default)]
@@ -203,7 +207,7 @@ impl<'tcx> ConstraintGraph<'tcx> {
         if let Some(idx) = self.node_map.get(&node) {
             *idx
         } else {
-            let idx = self.graph.add_node(node);
+            let idx = self.graph.add_node(node.clone());
             self.node_map.insert(node, idx);
             idx
         }
@@ -221,7 +225,7 @@ impl<'tcx> ConstraintGraph<'tcx> {
         self.graph.add_edge(rhs, lhs, ConstraintEdge::Address);
     }
 
-    fn add_constant(&mut self, constant: ConstantKind<'tcx>) {
+    fn add_constant(&mut self, constant: Const<'tcx>) {
         let lhs = ConstraintNode::Constant(constant);
         let rhs = ConstraintNode::ConstantDeref(constant);
         let lhs = self.get_or_insert_node(lhs);
@@ -248,7 +252,7 @@ impl<'tcx> ConstraintGraph<'tcx> {
         self.graph.add_edge(rhs, lhs, ConstraintEdge::Copy);
     }
 
-    fn add_copy_constant(&mut self, lhs: PlaceRef<'tcx>, rhs: ConstantKind<'tcx>) {
+    fn add_copy_constant(&mut self, lhs: PlaceRef<'tcx>, rhs: Const<'tcx>) {
         let lhs = ConstraintNode::Place(lhs);
         let rhs = ConstraintNode::Constant(rhs);
         let lhs = self.get_or_insert_node(lhs);
@@ -272,7 +276,7 @@ impl<'tcx> ConstraintGraph<'tcx> {
         self.graph.add_edge(rhs, lhs, ConstraintEdge::Store);
     }
 
-    fn add_store_constant(&mut self, lhs: PlaceRef<'tcx>, rhs: ConstantKind<'tcx>) {
+    fn add_store_constant(&mut self, lhs: PlaceRef<'tcx>, rhs: Const<'tcx>) {
         let lhs = ConstraintNode::Place(lhs);
         let rhs = ConstraintNode::Constant(rhs);
         let lhs = self.get_or_insert_node(lhs);
@@ -289,14 +293,14 @@ impl<'tcx> ConstraintGraph<'tcx> {
     }
 
     fn nodes(&self) -> Vec<ConstraintNode<'tcx>> {
-        self.node_map.keys().copied().collect::<_>()
+        self.node_map.keys().cloned().collect::<_>()
     }
 
     fn edges(&self) -> Vec<(ConstraintNode<'tcx>, ConstraintNode<'tcx>, ConstraintEdge)> {
         let mut v = Vec::new();
         for edge in self.graph.edge_references() {
-            let source = self.graph.node_weight(edge.source()).copied().unwrap();
-            let target = self.graph.node_weight(edge.target()).copied().unwrap();
+            let source = self.graph.node_weight(edge.source()).cloned().unwrap();
+            let target = self.graph.node_weight(edge.target()).cloned().unwrap();
             let weight = *edge.weight();
             v.push((source, target, weight));
         }
@@ -310,7 +314,7 @@ impl<'tcx> ConstraintGraph<'tcx> {
         let mut sources = Vec::new();
         for edge in self.graph.edges_directed(lhs, Direction::Incoming) {
             if *edge.weight() == ConstraintEdge::Store {
-                let source = self.graph.node_weight(edge.source()).copied().unwrap();
+                let source = self.graph.node_weight(edge.source()).cloned().unwrap();
                 sources.push(source);
             }
         }
@@ -324,7 +328,7 @@ impl<'tcx> ConstraintGraph<'tcx> {
         let mut targets = Vec::new();
         for edge in self.graph.edges_directed(rhs, Direction::Outgoing) {
             if *edge.weight() == ConstraintEdge::Load {
-                let target = self.graph.node_weight(edge.target()).copied().unwrap();
+                let target = self.graph.node_weight(edge.target()).cloned().unwrap();
                 targets.push(target);
             }
         }
@@ -338,7 +342,7 @@ impl<'tcx> ConstraintGraph<'tcx> {
         let mut targets = Vec::new();
         for edge in self.graph.edges_directed(rhs, Direction::Outgoing) {
             if *edge.weight() == ConstraintEdge::Copy {
-                let target = self.graph.node_weight(edge.target()).copied().unwrap();
+                let target = self.graph.node_weight(edge.target()).cloned().unwrap();
                 targets.push(target);
             }
         }
@@ -367,7 +371,7 @@ impl<'tcx> ConstraintGraph<'tcx> {
                     .edges_directed(copy_alias_target, Direction::Outgoing)
                     .filter_map(|edge| {
                         if *edge.weight() == ConstraintEdge::Address {
-                            Some(self.graph.node_weight(edge.target()).copied().unwrap())
+                            Some(self.graph.node_weight(edge.target()).cloned().unwrap())
                         } else {
                             None
                         }
@@ -426,33 +430,36 @@ impl<'a, 'tcx> ConstraintGraphCollector<'a, 'tcx> {
 
     fn process_assignment(&mut self, place: &Place<'tcx>, rvalue: &Rvalue<'tcx>) {
         let lhs_pattern = Self::process_place(place.as_ref());
-        let rhs_pattern = Self::process_rvalue(rvalue);
-        match (lhs_pattern, rhs_pattern) {
-            // a = &b
-            (AccessPattern::Direct(lhs), Some(AccessPattern::Ref(rhs))) => {
-                self.graph.add_address(lhs, rhs);
+        let rhs_patterns = Self::process_rvalue(rvalue);
+
+        for rhs_pattern in rhs_patterns.into_iter() {
+            match (&lhs_pattern, rhs_pattern) {
+                // a = &b
+                (AccessPattern::Direct(lhs), Some(AccessPattern::Ref(rhs))) => {
+                    self.graph.add_address(*lhs, rhs);
+                }
+                // a = b
+                (AccessPattern::Direct(lhs), Some(AccessPattern::Direct(rhs))) => {
+                    self.graph.add_copy(*lhs, rhs);
+                }
+                // a = Constant
+                (AccessPattern::Direct(lhs), Some(AccessPattern::Constant(rhs))) => {
+                    self.graph.add_copy_constant(*lhs, rhs);
+                }
+                // a = *b
+                (AccessPattern::Direct(lhs), Some(AccessPattern::Indirect(rhs))) => {
+                    self.graph.add_load(*lhs, rhs);
+                }
+                // *a = b
+                (AccessPattern::Indirect(lhs), Some(AccessPattern::Direct(rhs))) => {
+                    self.graph.add_store(*lhs, rhs);
+                }
+                // *a = Constant
+                (AccessPattern::Indirect(lhs), Some(AccessPattern::Constant(rhs))) => {
+                    self.graph.add_store_constant(*lhs, rhs);
+                }
+                _ => {}
             }
-            // a = b
-            (AccessPattern::Direct(lhs), Some(AccessPattern::Direct(rhs))) => {
-                self.graph.add_copy(lhs, rhs);
-            }
-            // a = Constant
-            (AccessPattern::Direct(lhs), Some(AccessPattern::Constant(rhs))) => {
-                self.graph.add_copy_constant(lhs, rhs);
-            }
-            // a = *b
-            (AccessPattern::Direct(lhs), Some(AccessPattern::Indirect(rhs))) => {
-                self.graph.add_load(lhs, rhs);
-            }
-            // *a = b
-            (AccessPattern::Indirect(lhs), Some(AccessPattern::Direct(rhs))) => {
-                self.graph.add_store(lhs, rhs);
-            }
-            // *a = Constant
-            (AccessPattern::Indirect(lhs), Some(AccessPattern::Constant(rhs))) => {
-                self.graph.add_store_constant(lhs, rhs);
-            }
-            _ => {}
         }
     }
 
@@ -469,32 +476,40 @@ impl<'a, 'tcx> ConstraintGraphCollector<'a, 'tcx> {
         }
     }
 
-    fn process_rvalue(rvalue: &Rvalue<'tcx>) -> Option<AccessPattern<'tcx>> {
+    fn process_operand(operand: &Operand<'tcx>) -> Option<AccessPattern<'tcx>> {
+        match operand {
+            Operand::Move(place) | Operand::Copy(place) => {
+                Some(AccessPattern::Direct(place.as_ref()))
+            }
+            Operand::Constant(box ConstOperand {
+                span: _,
+                user_ty: _,
+                const_,
+            }) => Some(AccessPattern::Constant(*const_)),
+        }
+    }
+
+    fn process_rvalue(rvalue: &Rvalue<'tcx>) -> Vec<Option<AccessPattern<'tcx>>> {
         match rvalue {
             Rvalue::Use(operand) | Rvalue::Repeat(operand, _) | Rvalue::Cast(_, operand, _) => {
-                match operand {
-                    Operand::Move(place) | Operand::Copy(place) => {
-                        Some(AccessPattern::Direct(place.as_ref()))
-                    }
-                    Operand::Constant(box Constant {
-                        span: _,
-                        user_ty: _,
-                        literal,
-                    }) => Some(AccessPattern::Constant(*literal)),
-                }
+                vec![Self::process_operand(operand)]
             }
             // Regard `p = &*q` as `p = q`
-            Rvalue::Ref(_, _, place) | Rvalue::AddressOf(_, place) => match place.as_ref() {
+            Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place) => match place.as_ref() {
                 PlaceRef {
                     local: l,
                     projection: [ProjectionElem::Deref, ref remain @ ..],
-                } => Some(AccessPattern::Direct(PlaceRef {
+                } => vec![Some(AccessPattern::Direct(PlaceRef {
                     local: l,
                     projection: remain,
-                })),
-                _ => Some(AccessPattern::Ref(place.as_ref())),
+                }))],
+                _ => vec![Some(AccessPattern::Ref(place.as_ref()))],
             },
-            _ => None,
+            Rvalue::Aggregate(_, fields) => {
+                let fields = fields.iter().map(Self::process_operand).collect::<Vec<_>>();
+                fields
+            }
+            _ => vec![],
         }
     }
 
@@ -557,14 +572,16 @@ impl<'a, 'tcx> Visitor<'tcx> for ConstraintGraphCollector<'a, 'tcx> {
             | StatementKind::AscribeUserType(_, _)
             | StatementKind::Coverage(_)
             | StatementKind::Nop
-            | StatementKind::Intrinsic(_)
             | StatementKind::PlaceMention(_)
-            | StatementKind::ConstEvalCounter => {}
+            | StatementKind::ConstEvalCounter
+            | StatementKind::Intrinsic(_) => {}
         }
     }
 
     /// For destination = Arc::clone(move arg0) and destination = ptr::read(move arg0),
     /// destination = alias copy args0
+    /// For AtomicPtr::store(move args0, move args1, move args2),
+    /// args0 = copy args1
     /// For other callsites like `destination = call fn(move args0)`,
     /// heuristically assumes that
     /// destination = copy args0
@@ -576,19 +593,47 @@ impl<'a, 'tcx> Visitor<'tcx> for ConstraintGraphCollector<'a, 'tcx> {
             ..
         } = &terminator.kind
         {
-            if let (&[Operand::Move(arg)], dest) = (args.as_slice(), destination) {
-                let func_ty = func.ty(self.body, self.tcx);
-                match func_ty.kind() {
-                    TyKind::FnDef(def_id, substs)
+            match (
+                args
+                    .iter()
+                    .map(|x| x.node.clone())
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+                destination,
+            ) {
+                (&[Operand::Move(arg)], dest) | (&[Operand::Copy(arg)], dest) => {
+                    let func_ty = func.ty(self.body, self.tcx);
+                    if let TyKind::FnDef(def_id, substs) = func_ty.kind() {
                         if ownership::is_arc_or_rc_clone(*def_id, substs, self.tcx)
-                            || ownership::is_ptr_read(*def_id, self.tcx) =>
-                    {
-                        return self.process_alias_copy(arg.as_ref(), dest.as_ref());
+                            || ownership::is_ptr_read(*def_id, self.tcx)
+                        {
+                            return self.process_alias_copy(arg.as_ref(), dest.as_ref());
+                        }
                     }
-                    _ => {}
+                    self.process_call_arg_dest(arg.as_ref(), dest.as_ref());
                 }
-                self.process_call_arg_dest(arg.as_ref(), dest.as_ref());
-            };
+                (&[Operand::Move(arg), _], dest) => {
+                    let func_ty = func.ty(self.body, self.tcx);
+                    if let TyKind::FnDef(def_id, _) = func_ty.kind() {
+                        if ownership::is_index(*def_id, self.tcx) {
+                            // index(arg0, arg1)
+                            // e.g., <String as Index<std::ops::Range<usize>>>::index(move _97, move _98)
+                            return self.process_call_arg_dest(arg.as_ref(), dest.as_ref());
+                        }
+                    }
+                }
+                (&[Operand::Move(arg0), Operand::Move(arg1), Operand::Move(_arg2)], _dest)
+                | (&[Operand::Move(arg0), Operand::Move(arg1), Operand::Copy(_arg2)], _dest) => {
+                    let func_ty = func.ty(self.body, self.tcx);
+                    if let TyKind::FnDef(def_id, list) = func_ty.kind() {
+                        if is_atomic_ptr_store(*def_id, list, self.tcx) {
+                            // AtomicPtr::store(arg0, arg1, ord) equals to arg0 = call(arg1)
+                            return self.process_call_arg_dest(arg1.as_ref(), arg0.as_ref());
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
     }
 }
@@ -686,6 +731,9 @@ impl<'a, 'tcx> AliasAnalysis<'a, 'tcx> {
                 let node1 = ConstraintNode::Place(Place::from(local1).as_ref());
                 let node2 = ConstraintNode::Place(Place::from(local2).as_ref());
                 if instance1.def_id() == instance2.def_id() {
+                    if local1 == local2 {
+                        return ApproximateAliasKind::Probably;
+                    }
                     self.intraproc_alias(instance1, &node1, &node2)
                         .unwrap_or(ApproximateAliasKind::Unknown)
                 } else {
@@ -724,40 +772,69 @@ impl<'a, 'tcx> AliasAnalysis<'a, 'tcx> {
             (Some(instance1), Some(instance2)) => {
                 let node1 = ConstraintNode::Place(Place::from(local1).as_ref());
                 let node2 = ConstraintNode::Place(Place::from(local2).as_ref());
-                let body1 = self.tcx.instance_mir(instance1.def);
-                let points_to_map = self.get_or_insert_pts(instance1.def_id(), body1).clone();
                 if instance1.def_id() == instance2.def_id() {
-                    let mut final_alias_kind = ApproximateAliasKind::Unknown;
-                    for local_pointee in &points_to_map[&node1] {
-                        let alias_kind = self
-                            .intraproc_alias(instance1, local_pointee, &node2)
-                            .unwrap_or(ApproximateAliasKind::Unknown);
-                        if alias_kind > final_alias_kind {
-                            final_alias_kind = alias_kind;
-                        }
-                    }
-                    final_alias_kind
+                    self.intra_points_to(instance1, node1, node2)
                 } else {
-                    let mut final_alias_kind = ApproximateAliasKind::Unknown;
-                    for local_pointee in &points_to_map[&node1] {
-                        let alias_kind = self
-                            .interproc_alias(instance1, local_pointee, instance2, &node2)
-                            .unwrap_or(ApproximateAliasKind::Unknown);
-                        if alias_kind > final_alias_kind {
-                            final_alias_kind = alias_kind;
-                        }
-                    }
-                    final_alias_kind
+                    self.inter_points_to(instance1, node1, instance2, node2)
                 }
             }
             _ => ApproximateAliasKind::Unknown,
         }
     }
 
+    pub fn intra_points_to(
+        &mut self,
+        instance: &Instance<'tcx>,
+        pointer: ConstraintNode<'tcx>,
+        pointee: ConstraintNode<'tcx>,
+    ) -> ApproximateAliasKind {
+        let body = self.tcx.instance_mir(instance.def);
+        let points_to_map = self.get_or_insert_pts(instance.def_id(), body).clone();
+        let mut final_alias_kind = ApproximateAliasKind::Unknown;
+        let set = match points_to_map.get(&pointer) {
+            Some(set) => set,
+            None => return ApproximateAliasKind::Unlikely,
+        };
+        for local_pointee in set {
+            let alias_kind = self
+                .intraproc_alias(instance, local_pointee, &pointee)
+                .unwrap_or(ApproximateAliasKind::Unknown);
+            if alias_kind > final_alias_kind {
+                final_alias_kind = alias_kind;
+            }
+        }
+        final_alias_kind
+    }
+
+    pub fn inter_points_to(
+        &mut self,
+        instance1: &Instance<'tcx>,
+        pointer: ConstraintNode<'tcx>,
+        instance2: &Instance<'tcx>,
+        pointee: ConstraintNode<'tcx>,
+    ) -> ApproximateAliasKind {
+        let body1 = self.tcx.instance_mir(instance1.def);
+        let points_to_map = self.get_or_insert_pts(instance1.def_id(), body1).clone();
+        let mut final_alias_kind = ApproximateAliasKind::Unknown;
+        let set = match points_to_map.get(&pointer) {
+            Some(set) => set,
+            None => return ApproximateAliasKind::Unlikely,
+        };
+        for local_pointee in set {
+            let alias_kind = self
+                .interproc_alias(instance1, local_pointee, instance2, &pointee)
+                .unwrap_or(ApproximateAliasKind::Unknown);
+            if alias_kind > final_alias_kind {
+                final_alias_kind = alias_kind;
+            }
+        }
+        final_alias_kind
+    }
+
     /// Get the points-to info from cache `pts`.
     /// If not exists, then perform points-to analysis
     /// and add the obtained points-to info to cache.
-    fn get_or_insert_pts(&mut self, def_id: DefId, body: &Body<'tcx>) -> &PointsToMap<'tcx> {
+    pub fn get_or_insert_pts(&mut self, def_id: DefId, body: &Body<'tcx>) -> &PointsToMap<'tcx> {
         if self.pts.contains_key(&def_id) {
             self.pts.get(&def_id).unwrap()
         } else {
@@ -867,8 +944,8 @@ impl<'a, 'tcx> AliasAnalysis<'a, 'tcx> {
         // 3. Check if `node1` and `node2` point to upvars of closures and the upvars alias in the def func.
         // 3.1 Get defsite upvars of `node1` then check if `node2` points to the upvar.
         let mut defsite_upvars1 = None;
-        if self.tcx.is_closure(instance1.def_id()) {
-            let pts_paths = points_to_paths_to_param(*node1, body1, &points_to_map1);
+        if self.tcx.is_closure_like(instance1.def_id()) {
+            let pts_paths = points_to_paths_to_param(node1.clone(), body1, &points_to_map1);
             for pts_path in pts_paths {
                 let defsite_upvars = match self.closure_defsite_upvars(instance1, pts_path) {
                     Some(defsite_upvars) => defsite_upvars,
@@ -877,7 +954,7 @@ impl<'a, 'tcx> AliasAnalysis<'a, 'tcx> {
                 for (def_inst, upvar) in defsite_upvars.iter() {
                     if def_inst.def_id() == instance2.def_id() {
                         let alias_kind = self
-                            .intraproc_points_to(def_inst, *node2, *upvar)
+                            .intraproc_points_to(def_inst, node2.clone(), upvar.clone())
                             .unwrap_or(ApproximateAliasKind::Unknown);
                         if alias_kind > ApproximateAliasKind::Unlikely {
                             return Some(alias_kind);
@@ -892,8 +969,8 @@ impl<'a, 'tcx> AliasAnalysis<'a, 'tcx> {
         }
         // 3.2 Get defsite upvars of `node2` then check if `node1` points to the upvar.
         let mut defsite_upvars2 = None;
-        if self.tcx.is_closure(instance2.def_id()) {
-            let pts_paths = points_to_paths_to_param(*node2, body2, &points_to_map2);
+        if self.tcx.is_closure_like(instance2.def_id()) {
+            let pts_paths = points_to_paths_to_param(node2.clone(), body2, &points_to_map2);
             for pts_path in pts_paths {
                 let defsite_upvars = match self.closure_defsite_upvars(instance2, pts_path) {
                     Some(defsite_upvars) => defsite_upvars,
@@ -902,7 +979,7 @@ impl<'a, 'tcx> AliasAnalysis<'a, 'tcx> {
                 for (def_inst, upvar) in defsite_upvars.iter() {
                     if def_inst.def_id() == instance1.def_id() {
                         let alias_kind = self
-                            .intraproc_points_to(def_inst, *node1, *upvar)
+                            .intraproc_points_to(def_inst, node1.clone(), upvar.clone())
                             .unwrap_or(ApproximateAliasKind::Unknown);
                         if alias_kind > ApproximateAliasKind::Unlikely {
                             return Some(alias_kind);
@@ -962,6 +1039,11 @@ impl<'a, 'tcx> AliasAnalysis<'a, 'tcx> {
         } else {
             Some(def_inst_upvars)
         }
+    }
+
+    #[allow(dead_code)]
+    pub fn points_to_map(&self, def_id: DefId) -> Option<&PointsToMap<'tcx>> {
+        self.pts.get(&def_id)
     }
 }
 
@@ -1088,14 +1170,14 @@ fn dfs_paths_recur<'tcx>(
     result: &mut Vec<PointsToPath<'tcx>>,
 ) {
     // Exit if the node has been visited or is not Alloc or Place.
-    if !visited.insert(node) {
+    if !visited.insert(node.clone()) {
         return;
     }
     let place = match node {
         ConstraintNode::Alloc(place) | ConstraintNode::Place(place) => place,
         _ => return,
     };
-    path.push((prev_proj, node));
+    path.push((prev_proj, node.clone()));
     // If found a path to the parameter, then output it to result.
     if is_parameter(place.local, body) {
         result.push(path.clone());

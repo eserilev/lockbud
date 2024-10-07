@@ -21,7 +21,11 @@ impl Default for CrateNameList {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum DetectorKind {
+    All,
     Deadlock,
+    AtomicityViolation,
+    Memory,
+    Panic,
     // More to be supported.
 }
 
@@ -33,7 +37,7 @@ fn make_options_parser<'help>() -> Command<'help> {
             Arg::new("kind")
                 .short('k')
                 .long("detector-kind")
-                .possible_values(["deadlock"])
+                .possible_values(["deadlock", "atomicity_violation", "memory", "all", "panic"])
                 .default_values(&["deadlock"])
                 .help("The detector kind"),
         )
@@ -80,6 +84,10 @@ impl Options {
         let matches = app.try_get_matches_from(flags.iter())?;
         let detector_kind = match matches.value_of("kind") {
             Some("deadlock") => DetectorKind::Deadlock,
+            Some("atomicity_violation") => DetectorKind::AtomicityViolation,
+            Some("memory") => DetectorKind::Memory,
+            Some("all") => DetectorKind::All,
+            Some("panic") => DetectorKind::Panic,
             _ => return Err("UnsupportedDetectorKind")?,
         };
         let black = matches.is_present("black");
