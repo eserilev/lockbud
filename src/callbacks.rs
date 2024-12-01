@@ -13,7 +13,7 @@ use rustc_driver::Compilation;
 use rustc_hir::def_id::LOCAL_CRATE;
 use rustc_interface::interface;
 use rustc_middle::mir::mono::MonoItem;
-use rustc_middle::ty::{Instance, TypingEnv, TyCtxt};
+use rustc_middle::ty::{Instance, TyCtxt, TypingEnv};
 
 use crate::analysis::callgraph::CallGraph;
 
@@ -60,10 +60,10 @@ impl rustc_driver::Callbacks for LockBudCallbacks {
             Some(path_buf) => self.output_directory.push(path_buf.as_path()),
         }
     }
-    fn after_analysis<'tcx>(
+    fn after_analysis(
         &mut self,
         compiler: &rustc_interface::interface::Compiler,
-        queries: &'tcx rustc_interface::Queries<'tcx>,
+        tcx: TyCtxt<'_>,
     ) -> rustc_driver::Compilation {
         compiler.sess.dcx().abort_if_errors();
         if self
@@ -75,9 +75,7 @@ impl rustc_driver::Callbacks for LockBudCallbacks {
             // No need to analyze a build script, but do generate code.
             return Compilation::Continue;
         }
-        queries.global_ctxt().unwrap().enter(|tcx| {
-            self.analyze_with_lockbud(compiler, tcx);
-        });
+        self.analyze_with_lockbud(compiler, tcx);
         if self.test_run {
             // We avoid code gen for test cases because LLVM is not used in a thread safe manner.
             Compilation::Stop

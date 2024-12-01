@@ -259,7 +259,7 @@ impl<'a, 'b, 'tcx> LockGuardCollector<'a, 'b, 'tcx> {
     }
 }
 
-impl<'a, 'b, 'tcx> Visitor<'tcx> for LockGuardCollector<'a, 'b, 'tcx> {
+impl<'tcx> Visitor<'tcx> for LockGuardCollector<'_, '_, 'tcx> {
     fn visit_local(&mut self, local: Local, context: PlaceContext, location: Location) {
         let lockguard_id = LockGuardId::new(self.instance_id, local);
         // local is lockguard

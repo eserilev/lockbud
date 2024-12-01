@@ -16,7 +16,7 @@ use petgraph::{Directed, Graph};
 
 use rustc_middle::mir::visit::Visitor;
 use rustc_middle::mir::{Body, Local, LocalDecl, LocalKind, Location, Terminator, TerminatorKind};
-use rustc_middle::ty::{self, EarlyBinder, Instance, TypingEnv, TyCtxt, TyKind};
+use rustc_middle::ty::{self, EarlyBinder, Instance, TyCtxt, TyKind, TypingEnv};
 
 /// The NodeIndex in CallGraph, denoting a unique instance in CallGraph.
 pub type InstanceId = NodeIndex;
@@ -195,7 +195,7 @@ impl<'a, 'tcx> CallSiteCollector<'a, 'tcx> {
     }
 }
 
-impl<'a, 'tcx> Visitor<'tcx> for CallSiteCollector<'a, 'tcx> {
+impl<'tcx> Visitor<'tcx> for CallSiteCollector<'_, 'tcx> {
     /// Resolve direct call.
     /// Inspired by rustc_mir/src/transform/inline.rs#get_valid_function_call.
     fn visit_terminator(&mut self, terminator: &Terminator<'tcx>, location: Location) {
