@@ -9,7 +9,7 @@ use rustc_hash::FxHashMap;
 use rustc_middle::mir::visit::{MutatingUseContext, NonMutatingUseContext, PlaceContext, Visitor};
 use rustc_middle::mir::{Body, Local, Location, TerminatorKind};
 use rustc_middle::ty::EarlyBinder;
-use rustc_middle::ty::{self, Instance, ParamEnv, TyCtxt};
+use rustc_middle::ty::{self, Instance, TypingEnv, TyCtxt};
 use rustc_span::Span;
 
 use crate::analysis::callgraph::InstanceId;
@@ -220,7 +220,7 @@ pub struct LockGuardCollector<'a, 'b, 'tcx> {
     instance: &'a Instance<'tcx>,
     body: &'b Body<'tcx>,
     tcx: TyCtxt<'tcx>,
-    param_env: ParamEnv<'tcx>,
+    typing_env: TypingEnv<'tcx>,
     pub lockguards: LockGuardMap<'tcx>,
 }
 
@@ -230,14 +230,14 @@ impl<'a, 'b, 'tcx> LockGuardCollector<'a, 'b, 'tcx> {
         instance: &'a Instance<'tcx>,
         body: &'b Body<'tcx>,
         tcx: TyCtxt<'tcx>,
-        param_env: ParamEnv<'tcx>,
+        typing_env: TypingEnv<'tcx>,
     ) -> Self {
         Self {
             instance_id,
             instance,
             body,
             tcx,
-            param_env,
+            typing_env,
             lockguards: Default::default(),
         }
     }
@@ -246,7 +246,7 @@ impl<'a, 'b, 'tcx> LockGuardCollector<'a, 'b, 'tcx> {
         for (local, local_decl) in self.body.local_decls.iter_enumerated() {
             let local_ty = self.instance.instantiate_mir_and_normalize_erasing_regions(
                 self.tcx,
-                self.param_env,
+                self.typing_env,
                 EarlyBinder::bind(local_decl.ty),
             );
             if let Some(lockguard_ty) = LockGuardTy::from_local_ty(local_ty, self.tcx) {
@@ -284,7 +284,7 @@ impl<'a, 'b, 'tcx> Visitor<'tcx> for LockGuardCollector<'a, 'b, 'tcx> {
                                 let func_ty =
                                     self.instance.instantiate_mir_and_normalize_erasing_regions(
                                         self.tcx,
-                                        self.param_env,
+                                        self.typing_env,
                                         EarlyBinder::bind(func_ty),
                                     );
                                 if let ty::FnDef(def_id, _) = *func_ty.kind() {

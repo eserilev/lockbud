@@ -590,7 +590,8 @@ impl<'a, 'tcx> Visitor<'tcx> for ConstraintGraphCollector<'a, 'tcx> {
             | StatementKind::Nop
             | StatementKind::PlaceMention(_)
             | StatementKind::ConstEvalCounter
-            | StatementKind::Intrinsic(_) => {}
+            | StatementKind::Intrinsic(_)
+            | StatementKind::BackwardIncompatibleDropHint { .. } => {}
         }
     }
 
